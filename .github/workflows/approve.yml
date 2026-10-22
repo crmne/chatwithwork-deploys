@@ -1,0 +1,100 @@
+# Carmine's approval of one Chat with Work deploy (crmne/chatwithwork,
+# docs/security/deploy-approval.md). The deploy's pre-deploy hook dispatches
+# this with the exact commit and image digest about to go live. The job waits
+# in the `production` environment until Carmine, its required reviewer,
+# approves it in GitHub (the phone app notifies him); only then does it get
+# the environment's signing key, sign that request, and hand the signature
+# back as an artifact. The hook checks the signature against the public key
+# committed in crmne/chatwithwork and refuses the deploy without it.
+#
+# `dry-run` is the same flow with no reviewer and a key of its own that
+# production never trusts, for testing the plumbing.
+name: Approve a deploy
+run-name: "${{ inputs.environment }}: ${{ inputs.sha }} (${{ inputs.nonce }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: production, or dry-run to test
+        type: choice
+        options: [production, dry-run]
+        required: true
+      sha:
+        description: The crmne/chatwithwork commit being deployed
+        type: string
+        required: true
+      digest:
+        description: The image digest the hosts pulled (sha256:...)
+        type: string
+        required: true
+      command:
+        description: The Kamal command (deploy, redeploy, rollback, setup)
+        type: string
+        required: true
+      nonce:
+        description: A random value naming this request
+        type: string
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: approve-${{ inputs.nonce }}
+  cancel-in-progress: false
+
+jobs:
+  approve:
+    name: Approve
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 5
+    steps:
+      # Inputs reach the shell only through the environment, never pasted
+      # into the script, and must have exactly the expected shape.
+      - name: Check the request
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          SHA: ${{ inputs.sha }}
+          DIGEST: ${{ inputs.digest }}
+          COMMAND: ${{ inputs.command }}
+          NONCE: ${{ inputs.nonce }}
+        run: |
+          set -euo pipefail
+          [[ "$ENVIRONMENT" =~ ^(production|dry-run)$ ]]
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$COMMAND" =~ ^(deploy|redeploy|rollback|setup)$ ]]
+          [[ "$NONCE" =~ ^[0-9a-f]{32}$ ]]
+
+      - name: Sign the approval
+        env:
+          KEY: ${{ secrets.DEPLOY_APPROVAL_KEY }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          SHA: ${{ inputs.sha }}
+          DIGEST: ${{ inputs.digest }}
+          COMMAND: ${{ inputs.command }}
+          NONCE: ${{ inputs.nonce }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p approval
+          key="$RUNNER_TEMP/approval_key"
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$KEY" > "$key"
+          jq -cn \
+            --arg repository crmne/chatwithwork --arg environment "$ENVIRONMENT" \
+            --arg sha "$SHA" --arg digest "$DIGEST" --arg command "$COMMAND" --arg nonce "$NONCE" \
+            --arg run_id "$GITHUB_RUN_ID" --arg approved_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{repository: $repository, environment: $environment, sha: $sha, digest: $digest, command: $command, nonce: $nonce, run_id: $run_id, approved_at: $approved_at}' \
+            > approval/approval.json
+          ssh-keygen -q -Y sign -n "chatwithwork-deploy-$ENVIRONMENT" -f "$key" approval/approval.json
+          cat approval/approval.json
+
+      - name: Hand the signed approval back
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: approval
+          path: approval/
+          retention-days: 7
+          if-no-files-found: error
