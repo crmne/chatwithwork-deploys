@@ -7,6 +7,18 @@
 # back as an artifact. The hook checks the signature against the public key
 # committed in crmne/chatwithwork and refuses the deploy without it.
 #
+# A deploy from GitHub Actions (crmne/chatwithwork's deploy.yml) also sends
+# the public half of an SSH key it made for this one deploy. After the
+# approval, and only then, the job certifies that key with the environment's
+# SSH certificate authority, for two hours, as the `chatwithwork-deploy`
+# principal the production host lets in as root. The certificate is public
+# (it is useless without the key, which never leaves the deploy's job), so it
+# goes back in the same artifact. A deploy from Carmine's machine sends no
+# key and gets no certificate.
+#
+# The master copy of this file is script/deploy_approvals/approve.yml in
+# crmne/chatwithwork, whose bin/deploy-approval pins its git blob.
+#
 # `dry-run` is the same flow with no reviewer and a key of its own that
 # production never trusts, for testing the plumbing.
 name: Approve a deploy
@@ -36,6 +48,11 @@ on:
         description: A random value naming this request
         type: string
         required: true
+      ssh_key:
+        description: The deploy's own SSH public key (ssh-ed25519 ...) to certify, or empty
+        type: string
+        required: false
+        default: ""
 
 permissions: {}
 
@@ -59,6 +76,7 @@ jobs:
           DIGEST: ${{ inputs.digest }}
           COMMAND: ${{ inputs.command }}
           NONCE: ${{ inputs.nonce }}
+          SSH_KEY: ${{ inputs.ssh_key }}
         run: |
           set -euo pipefail
           [[ "$ENVIRONMENT" =~ ^(production|dry-run)$ ]]
@@ -66,6 +84,7 @@ jobs:
           [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$COMMAND" =~ ^(deploy|redeploy|rollback|setup)$ ]]
           [[ "$NONCE" =~ ^[0-9a-f]{32}$ ]]
+          [[ -z "$SSH_KEY" || "$SSH_KEY" =~ ^ssh-ed25519\ AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}$ ]]
 
       - name: Sign the approval
         env:
@@ -75,6 +94,7 @@ jobs:
           DIGEST: ${{ inputs.digest }}
           COMMAND: ${{ inputs.command }}
           NONCE: ${{ inputs.nonce }}
+          SSH_KEY: ${{ inputs.ssh_key }}
         run: |
           set -euo pipefail
           umask 077
@@ -85,11 +105,34 @@ jobs:
           jq -cn \
             --arg repository crmne/chatwithwork --arg environment "$ENVIRONMENT" \
             --arg sha "$SHA" --arg digest "$DIGEST" --arg command "$COMMAND" --arg nonce "$NONCE" \
-            --arg run_id "$GITHUB_RUN_ID" --arg approved_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{repository: $repository, environment: $environment, sha: $sha, digest: $digest, command: $command, nonce: $nonce, run_id: $run_id, approved_at: $approved_at}' \
+            --arg ssh_key "$SSH_KEY" --arg run_id "$GITHUB_RUN_ID" --arg approved_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{repository: $repository, environment: $environment, sha: $sha, digest: $digest, command: $command, nonce: $nonce, ssh_key: $ssh_key, run_id: $run_id, approved_at: $approved_at}' \
             > approval/approval.json
           ssh-keygen -q -Y sign -n "chatwithwork-deploy-$ENVIRONMENT" -f "$key" approval/approval.json
           cat approval/approval.json
+
+      # Only for a request that sent a key: a certificate for exactly that
+      # key, valid from five minutes ago (clock skew) for two hours, named
+      # after this run and the commit so the host's sshd log says which
+      # approval let each login in. No agent or X11 forwarding.
+      - name: Certify the deploy's SSH key
+        if: inputs.ssh_key != ''
+        env:
+          CA: ${{ secrets.DEPLOY_SSH_CA_KEY }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          SHA: ${{ inputs.sha }}
+          SSH_KEY: ${{ inputs.ssh_key }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [ -n "$CA" ] || { echo "The $ENVIRONMENT environment has no DEPLOY_SSH_CA_KEY."; exit 1; }
+          ca="$RUNNER_TEMP/ssh_ca"
+          trap 'rm -f "$ca"' EXIT
+          printf '%s\n' "$CA" > "$ca"
+          printf '%s\n' "$SSH_KEY" > approval/deploy_key.pub
+          ssh-keygen -q -s "$ca" -I "chatwithwork-deploy-$ENVIRONMENT-$GITHUB_RUN_ID-${SHA:0:12}" \
+            -n chatwithwork-deploy -V -5m:+2h -O no-agent-forwarding -O no-x11-forwarding approval/deploy_key.pub
+          ssh-keygen -L -f approval/deploy_key-cert.pub
 
       - name: Hand the signed approval back
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
